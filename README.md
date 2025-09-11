@@ -25,6 +25,7 @@ The bot constructs real-time 5-second OHLC candles, applies EMA/SMA crossover st
 Install dependencies:
 ```bash
 pip install fyers-apiv3 pandas numpy pytz TA-Lib
+```
 
 ## ▶️ Usage
 1. Generate your Fyers access token and save it in access_token.txt.
@@ -32,6 +33,7 @@ pip install fyers-apiv3 pandas numpy pytz TA-Lib
 3. Run the bot:
 ```bash
 python scalping_bot.py
+```
 
 ## ⚠️ Disclaimer
 
