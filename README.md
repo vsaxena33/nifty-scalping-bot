@@ -19,7 +19,7 @@ The bot constructs real-time 5-second OHLC candles, applies EMA/SMA crossover st
 ## ⚡ Requirements
 - Python 3.9+
 - [Fyers API v3](https://myapi.fyers.in/docs/)
-- [TA-Lib](https://mrjbq7.github.io/ta-lib/)
+- [TA-Lib](https://github.com/ta-lib/ta-lib-python)
 - pandas, numpy, pytz
 
 Install dependencies:
