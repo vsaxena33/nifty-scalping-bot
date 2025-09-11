@@ -6,7 +6,7 @@ The bot constructs real-time 5-second OHLC candles, applies EMA/SMA crossover st
 ## 🚀 Features
 - Fetches historical and live data using Fyers API.
 - Builds real-time 5-second OHLC candles from WebSocket ticks.
-- Incremental **Fast Moving Average** (e.g., EMA(9)) and **Slow Moving Average** (e.g., SMA(9)) updates. 
+- Incremental **Fast Moving Average (FMA)** (e.g., EMA(9)) and **Slow Moving Average (SMA)** (e.g., SMA(9)) updates. 
 - Scalping strategy with CE/PE entries and exits.
 - Cooldown logic to prevent over-trading.
 - Trade logs stored in CSV.
