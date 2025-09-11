@@ -14,6 +14,8 @@ The bot constructs real-time 5-second OHLC candles, applies EMA/SMA crossover st
 
 ## 📂 Project Structure
 - scalping_bot.py # Main trading bot code
+- credentials.py # Store Fyers client_id
+- access_token.txt # Generated TOTP access token
 - README.md
 
 ## ⚡ Requirements
