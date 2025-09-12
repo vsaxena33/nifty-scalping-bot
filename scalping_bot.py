@@ -2,7 +2,7 @@
 NIFTY Options Scalping Bot using Fyers API
 
 This script connects to the Fyers WebSocket, retrieves live NIFTY50 data, builds 5-second OHLC candles,
-and applies Fast Moving Average / Slow Moving Average strategies to generate BUY/SELL signals on ATM options.
+and applies EMA(9) / SMA(9) strategies to generate BUY/SELL signals on ATM options.
 
 Main Features:
 - Historical data retrieval for indices and options.
@@ -27,6 +27,7 @@ from fyers_apiv3 import fyersModel
 from credentials import client_id
 import talib as ta
 import numpy as np
+import math
 
 # -------------------------------
 # Utility Functions
@@ -43,14 +44,11 @@ def historical_data(symbol, today):
     Returns:
         DataFrame: OHLC data indexed by datetime with no volume column.
     """
-    
-    previous_date = today - dt.timedelta(days=3)
-
     data = {
         "symbol":symbol,
         "resolution":"5S",                              # 5-second candles
         "date_format":"1",                              # Epoch format
-        "range_from":previous_date,
+        "range_from":today,
         "range_to":today,
         "cont_flag":"1"
     }
@@ -71,40 +69,34 @@ def historical_data(symbol, today):
 
     return df
 
-def update_moving_averages(df, live_candle, ema_period=9, sma_period=9):
+def update_moving_averages(df, live_candle, period):
     """
     Incrementally update EMA and SMA using the last values from historical CSV and a new live candle.
 
     Parameters:
-        df (data frame): Historical candles with columns ['open','high','low','close','ema_9','sma_9']
+        df (data frame): Historical candles with columns ['open','high','low','close','ema_9','ema_15']
         live_candle (dict): New candle data {'open':..., 'high':..., 'low':..., 'close':...}
-        ema_period (int): EMA period (default 9)
-        sma_period (int): SMA period (default 9)
 
     Returns:
-        updated_ema (float): Updated EMA
-        updated_sma (float): Updated SMA
+        updated_ema (float): Updated EMA 9
+        updated_ema (float): Updated EMA 15
     """
     # Ensure df has enough rows for SMA calculation
-    if len(df) < sma_period:
-        raise ValueError(f"CSV must have at least {sma_period} rows for SMA calculation.")
+    if len(df) < period:
+        raise ValueError(f"CSV must have at least 15 rows for EMA calculation.")
 
     # Get last EMA
-    last_ema = df['ema_9'].iloc[-2]
+    last_ema = df[f'ema_{period}'].iloc[-2]
 
     # EMA update formula
-    alpha = 2 / (ema_period + 1)
+    alpha = 2 / (period + 1)
     updated_ema = alpha * live_candle['close'] + (1 - alpha) * last_ema
+    
+    return updated_ema
 
-    # SMA update formula (rolling window)
-    last_sma = df['sma_9'].iloc[-2]
-    updated_sma = (last_sma * sma_period - df['close'].iloc[-sma_period - 1] + live_candle['close']) / sma_period
-
-    return updated_ema, updated_sma
-
-def new_candle(df, message, ema_period=9, sma_period=9):
+def new_candle(df, message):
     """
-    Convert incoming Fyers WS tick into a 5s candle, and update EMA(9)/SMA(9).
+    Convert incoming Fyers WS tick into a 5s candle, and update EMA(9)/EMA(15).
 
     Parameters:
         df (DataFrame): Candle DataFrame with OHLC + ema/sma.
@@ -144,10 +136,10 @@ def new_candle(df, message, ema_period=9, sma_period=9):
         df.loc[timestamp_5s] = [ltp, ltp, ltp, ltp, np.nan, np.nan]
 
     # Update EMA & SMA for the last candle
-    updated_ema, updated_sma = update_moving_averages(df, {"close": df.at[timestamp_5s, "close"]},
-                                                      ema_period=ema_period, sma_period=sma_period)
-    df.at[timestamp_5s, "ema_9"] = updated_ema
-    df.at[timestamp_5s, "sma_9"] = updated_sma
+    updated_ema_9 = update_moving_averages(df, {"close": df.at[timestamp_5s, "close"]}, period=9)
+    updated_ema_15 = update_moving_averages(df, {"close": df.at[timestamp_5s, "close"]}, period=15)
+    df.at[timestamp_5s, "ema_9"] = updated_ema_9
+    df.at[timestamp_5s, "ema_15"] = updated_ema_15
 
     return df
 
@@ -201,11 +193,13 @@ class LiveOHLC:
             dfs_hist (dict): Mapping of {symbol: historical_dataframe}.
         """
         self.dfs = {sym: df for sym, df in dfs_hist.items()}
-        self.trend = None
+        self.trend = 0
         self.option = None
         self.position = False
         self.last_exit_time = None
         self.cooldown_seconds = 5   # Prevent re-entry for 5s after exit
+        self.sl = None
+        self.tp = None
         
     def onmessage(self, message):
         """
@@ -226,8 +220,15 @@ class LiveOHLC:
 
         # Update NIFTY50 candles and trend
         if symbol == "NSE:NIFTY50-INDEX":
-            self.dfs[symbol] = new_candle(self.dfs[symbol], message, ema_period=9, sma_period=9)
-            self.trend = self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['sma_9'].iloc[-2]
+            self.dfs[symbol] = new_candle(self.dfs[symbol], message)
+            if (self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['ema_15'].iloc[-2] and
+                5 * (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > 1 / math.sqrt(3)):
+                self.trend = 100
+            elif (self.dfs[symbol]['ema_15'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
+                  5 * (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-2]) > 1 / math.sqrt(3)):
+                self.trend = -100
+            else:
+                self.trend = 0
         
         # Cooldown check
         if self.last_exit_time is not None:
@@ -242,64 +243,74 @@ class LiveOHLC:
             """
             Attempt to enter CE or PE position based on trend and moving averages.
             """
-            if (self.trend and
+            candle = (ta.CDLMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                      ta.CDLCLOSINGMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                      ta.CDLDRAGONFLYDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                      ta.CDLGRAVESTONEDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                      ta.CDLHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) -
+                      ta.CDLINVERTEDHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']))
+            
+            if (self.trend > 10 and candle.iloc[-2] >= 1 and
                 self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
-                self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['sma_9'].iloc[-2]):
+                self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['ema_15'].iloc[-2]):
                 """
                 Buy ATM option and subscribe to its live feed.
                 """
                 self.option = get_atm_option(option_type="CE", nifty_price=message.get("ltp"))
                 response = fyers.quotes(data={"symbols":self.option})
+                entry = response["d"][0]["v"]["ask"]
 
-                print(response["d"][0]["v"]["ask"])
-                log_trade("BUY", self.option, response["d"][0]["v"]["ask"])
+                print(entry)
+                log_trade("BUY", self.option, entry)
 
                 self.position = True
                 fyers_socket.subscribe(symbols=[self.option], data_type="SymbolUpdate")
 
                 # Initialize option DataFrame with historical + indicators
                 option_df = historical_data(symbol=self.option, today=dt.date.today())
+                self.sl = option_df["low"].iloc[-1]
+                self.tp = entry + 1 * (entry - self.sl)
                 option_df['ema_9'] = ta.EMA(option_df['close'], 9)
-                option_df['sma_9'] = ta.MA(option_df['close'], 9)
+                option_df['ema_15'] = ta.EMA(option_df['close'], 15)
                 self.dfs[self.option] = option_df
-            elif ((not self.trend) and
+            elif (self.trend < -10 and candle.iloc[-2] <= -1 and
                   self.dfs[symbol]['close'].iloc[-2] < self.dfs[symbol]['ema_9'].iloc[-2] and
-                  self.dfs[symbol]['close'].iloc[-2] < self.dfs[symbol]['sma_9'].iloc[-2]):
+                  self.dfs[symbol]['close'].iloc[-2] < self.dfs[symbol]['ema_15'].iloc[-2]):
                 """
                 Buy ATM option and subscribe to its live feed.
                 """
                 self.option = get_atm_option(option_type="PE", nifty_price=message.get("ltp"))
                 response = fyers.quotes(data={"symbols":self.option})
-                
-                print(response["d"][0]["v"]["ask"])
-                log_trade("BUY", self.option, response["d"][0]["v"]["ask"])
+                entry = response["d"][0]["v"]["ask"]
+
+                print(entry)
+                log_trade("BUY", self.option, entry)
                 
                 self.position = True
                 fyers_socket.subscribe(symbols=[self.option], data_type="SymbolUpdate")
                 
                 # Initialize option DataFrame with historical + indicators
                 option_df = historical_data(symbol=self.option, today=dt.date.today())
+                self.sl = option_df["low"].iloc[-1]
+                self.tp = entry + 2 * (entry - self.sl)
                 option_df['ema_9'] = ta.EMA(option_df['close'], 9)
-                option_df['sma_9'] = ta.MA(option_df['close'], 9)
+                option_df['ema_15'] = ta.EMA(option_df['close'], 15)
                 self.dfs[self.option] = option_df
         
         # Exit Logic (if in position)
         if self.option and symbol == self.option:
             """Attempt to exit position based on price action or MA crossover."""
-            self.dfs[symbol] = new_candle(self.dfs[symbol], message, ema_period=9, sma_period=9)
+            self.dfs[symbol] = new_candle(self.dfs[symbol], message)
             
             print(self.dfs[symbol].tail())
             print(self.trend)
             
             if self.option.endswith("CE"):
                 """Exit logic for Call Options."""
-                if self.trend:
+                if self.trend > 10:
                     print("Price Action")
-                    second_last_row = self.dfs[symbol].iloc[-2]
 
-                    if (second_last_row['close'] < second_last_row['sma_9'] and
-                        second_last_row['close'] < second_last_row['ema_9'] and
-                        second_last_row.name.date() == dt.date.today()):
+                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -315,14 +326,10 @@ class LiveOHLC:
                     else:
                         print('holding')
                 
-                elif not self.trend:
+                else:
                     print('MA crossover')
-                    second_last_row = self.dfs[symbol].iloc[-2]
-                    first_last_row = self.dfs[symbol].iloc[-1]
 
-                    if (second_last_row['ema_9'] < second_last_row['sma_9'] or
-                        (first_last_row['close'] < first_last_row['sma_9'] and
-                        first_last_row['close'] < first_last_row['ema_9'])) and second_last_row.name.date() == dt.date.today():
+                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -339,13 +346,10 @@ class LiveOHLC:
                         print('holding')
             elif self.option.endswith("PE"):
                 """Exit logic for Put Options."""
-                if not self.trend:
+                if self.trend < -10:
                     print("Price Action")
-                    second_last_row = self.dfs[symbol].iloc[-2]
                     
-                    if (second_last_row['close'] < second_last_row['sma_9'] and
-                        second_last_row['close'] < second_last_row['ema_9'] and
-                        second_last_row.name.date() == dt.date.today()):
+                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -361,14 +365,10 @@ class LiveOHLC:
                     else:
                         print('holding')
                 
-                elif self.trend:
+                else:
                     print('MA crossover')
-                    second_last_row = self.dfs[symbol].iloc[-2]
-                    first_last_row = self.dfs[symbol].iloc[-1]
 
-                    if (second_last_row['ema_9'] < second_last_row['sma_9'] or
-                        (first_last_row['close'] < first_last_row['sma_9'] and
-                        first_last_row['close'] < first_last_row['ema_9'])) and second_last_row.name.date() == dt.date.today():
+                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -437,8 +437,8 @@ if __name__ == "__main__":
 
     # Fetch initial historical data for NIFTY50
     nifty_df = historical_data(symbol="NSE:NIFTY50-INDEX", today=dt.date.today())
-    nifty_df['ema_9'] = ta.EMA(nifty_df['close'], 9)    # Calculate EMA (Fast Moving Average) using 'close' as the source and a length of 9
-    nifty_df['sma_9'] = ta.MA(nifty_df['close'], 9)     # Calculate SMA (Slow Moving Average) using 'close' as the source and a length of 9
+    nifty_df['ema_9'] = ta.EMA(nifty_df['close'], 9)    # Calculate EMA using 'close' as the source and a length of 9
+    nifty_df['ema_15'] = ta.EMA(nifty_df['close'], 15)  # Calculate SMA using 'close' as the source and a length of 9
 
     df_hist = {"NSE:NIFTY50-INDEX": nifty_df}
 
