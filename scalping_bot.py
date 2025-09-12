@@ -227,9 +227,7 @@ class LiveOHLC:
         # Update NIFTY50 candles and trend
         if symbol == "NSE:NIFTY50-INDEX":
             self.dfs[symbol] = new_candle(self.dfs[symbol], message, ema_period=9, sma_period=9)
-            self.trend = (self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['sma_9'].iloc[-2] or
-                          self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] or
-                          self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['sma_9'].iloc[-2])
+            self.trend = self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['sma_9'].iloc[-2]
         
         # Cooldown check
         if self.last_exit_time is not None:
