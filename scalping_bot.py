@@ -1,13 +1,13 @@
 """
 NIFTY Options Scalping Bot using Fyers API
 
-This script connects to the Fyers WebSocket, retrieves live NIFTY50 data, builds 5-second OHLC candles,
-and applies EMA(9) / SMA(9) strategies to generate BUY/SELL signals on ATM options.
+This script connects to the Fyers WebSocket, retrieves live NIFTY50 data, builds 1-minute OHLC candles,
+and applies EMA(9) / EMA(15) strategies to generate BUY/SELL signals on ATM options.
 
 Main Features:
 - Historical data retrieval for indices and options.
-- Real-time candle construction (5s) from WebSocket ticks.
-- Incremental EMA and SMA updates.
+- Real-time candle construction (1 min) from WebSocket ticks.
+- Incremental EMAs update.
 - Automated entry/exit logic with cooldown periods.
 - Trade logging into a CSV file.
 
@@ -44,11 +44,13 @@ def historical_data(symbol, today):
     Returns:
         DataFrame: OHLC data indexed by datetime with no volume column.
     """
+    previous_date = (today - dt.timedelta(days=2))
+
     data = {
         "symbol":symbol,
-        "resolution":"5S",                              # 5-second candles
+        "resolution":"1",                               # 1-minute candles
         "date_format":"1",                              # Epoch format
-        "range_from":today,
+        "range_from":previous_date,
         "range_to":today,
         "cont_flag":"1"
     }
@@ -96,7 +98,7 @@ def update_moving_averages(df, live_candle, period):
 
 def new_candle(df, message):
     """
-    Convert incoming Fyers WS tick into a 5s candle, and update EMA(9)/EMA(15).
+    Convert incoming Fyers WS tick into a 1 min candle, and update EMA(9)/EMA(15).
 
     Parameters:
         df (DataFrame): Candle DataFrame with OHLC + ema/sma.
@@ -121,53 +123,89 @@ def new_candle(df, message):
     else:
         timestamp = pd.Timestamp.utcnow()
 
-    # Normalize to IST and floor to 5s
+    # Normalize to IST and floor to 5min
     ist = pytz.timezone("Asia/Kolkata")
     timestamp = timestamp.tz_localize("UTC").tz_convert(ist).tz_localize(None)
-    timestamp_5s = timestamp.floor("5s")
+    timestamp_1min = timestamp.floor("1min")
 
-    if timestamp_5s in df.index:
+    if timestamp_1min in df.index:
         # Update existing candle
-        df.at[timestamp_5s, "close"] = ltp
-        df.at[timestamp_5s, "high"] = max(df.at[timestamp_5s, "high"], ltp)
-        df.at[timestamp_5s, "low"] = min(df.at[timestamp_5s, "low"], ltp)
+        df.at[timestamp_1min, "close"] = ltp
+        df.at[timestamp_1min, "high"] = max(df.at[timestamp_1min, "high"], ltp)
+        df.at[timestamp_1min, "low"] = min(df.at[timestamp_1min, "low"], ltp)
     else:
         # Add new row
-        df.loc[timestamp_5s] = [ltp, ltp, ltp, ltp, np.nan, np.nan]
+        df.loc[timestamp_1min] = [ltp, ltp, ltp, ltp, np.nan, np.nan]
 
     # Update EMA & SMA for the last candle
-    updated_ema_9 = update_moving_averages(df, {"close": df.at[timestamp_5s, "close"]}, period=9)
-    updated_ema_15 = update_moving_averages(df, {"close": df.at[timestamp_5s, "close"]}, period=15)
-    df.at[timestamp_5s, "ema_9"] = updated_ema_9
-    df.at[timestamp_5s, "ema_15"] = updated_ema_15
+    updated_ema_9 = update_moving_averages(df, {"close": df.at[timestamp_1min, "close"]}, period=9)
+    updated_ema_15 = update_moving_averages(df, {"close": df.at[timestamp_1min, "close"]}, period=15)
+    df.at[timestamp_1min, "ema_9"] = updated_ema_9
+    df.at[timestamp_1min, "ema_15"] = updated_ema_15
 
     return df
 
-def get_atm_option(option_type, nifty_price):
+# NIFTY option chain
+def chain(fyers, timestamp):
+    """
+    Get option chain for NIFTY50.
+
+    Parameters:
+        fyres (object): Fyres library.
+        timestamp (date): Expiry of options
+    Returns:
+        dictionary: Option chain
+    """
+    option_data = {
+        "symbol":"NSE:NIFTY50-INDEX",                   # Option chain symbol
+        "strikecount":1,                                # Number of strike prices 
+        "timestamp": timestamp                          # Getting options for nearest expiry
+    }
+
+    option_chain = fyers.optionchain(data=option_data)  # Getting option chain
+    return option_chain
+
+# Getting time stamp
+def get_timestamp(fyers):
+    """
+    Get expiry of option symbol for NIFTY50.
+
+    Parameters:
+        fyres (object): Fyres library.
+    Returns:
+        date: Expiry of option
+    """
+    option_chain = chain(fyers=fyers, timestamp='')
+    today = dt.datetime.today().date().strftime("%d-%m-%Y")
+    if today == option_chain['data']['expiryData'][0]['date']:
+        timestamp = option_chain['data']['expiryData'][1]['expiry'] # Next expiry
+    else:
+        timestamp = option_chain['data']['expiryData'][0]['expiry']
+    return timestamp
+
+# Defining a function of returning an ATM call option with nearest expiry which is not expirying today
+def get_atm_option(fyers, nifty_price, option_type, timestamp):
     """
     Get At-The-Money (ATM) option symbol for NIFTY50.
 
     Parameters:
+        fyres (object): Fyres library.
         option_type (str): "CE" or "PE".
         nifty_price (float): Current NIFTY50 price.
+        timestamp (date): Expiry of option.
 
     Returns:
         str: ATM option symbol.
-    """
-    data = {
-        "symbol":"NSE:NIFTY50-INDEX",
-        "strikecount":1,
-        "timestamp": ""
-    }
-    response = fyers.optionchain(data=data)
-    
-    # Filter CE or PE and find closest strike
-    type_options = [option for option in response['data']['optionsChain'] if option['option_type'] == option_type]  # Getting options
-    atm_option = min(type_options, key=lambda option: abs(option['strike_price'] - nifty_price))                        # ATM option
-    
-    return atm_option['symbol']
+     """
 
-def log_trade(action, symbol, price):
+    option_chain = chain(fyers=fyers, timestamp=timestamp)                                                              # Option Chain
+    type_options = [option for option in option_chain['data']['optionsChain'] if option['option_type'] == option_type]  # Getting options
+    itm_options = ([option for option in type_options if option['strike_price'] <= nifty_price] if option_type == "CE"
+                   else [option for option in type_options if option['strike_price'] >= nifty_price])
+    option = min(itm_options, key=lambda option: abs(option['strike_price'] - nifty_price))                             # ATM/ITM option
+    return option['symbol']                                                                                             # Returning option
+
+def log_trade(action, symbol, price, stopLoss=None, takeProfit=None):
     """
     Append trade details to a CSV log.
 
@@ -177,7 +215,10 @@ def log_trade(action, symbol, price):
         price (float): Execution price.
     """
     with open("trades_log.csv", "a") as file:
-        file.write(f"{dt.datetime.now()},{action},{symbol},{price}\n")
+        if action == "BUY":
+            file.write(f"{dt.datetime.now()},{action},{symbol},{price},{stopLoss},{takeProfit}\n")
+        else:
+            file.write(f"{dt.datetime.now()},{action},{symbol},{price}\n")
 
 # -------------------------------
 # Live WebSocket Handler Class
@@ -197,7 +238,7 @@ class LiveOHLC:
         self.option = None
         self.position = False
         self.last_exit_time = None
-        self.cooldown_seconds = 5   # Prevent re-entry for 5s after exit
+        self.cooldown_seconds = 60   # Prevent re-entry for 1 min after exit
         self.sl = None
         self.tp = None
         
@@ -221,12 +262,31 @@ class LiveOHLC:
         # Update NIFTY50 candles and trend
         if symbol == "NSE:NIFTY50-INDEX":
             self.dfs[symbol] = new_candle(self.dfs[symbol], message)
+            
             if (self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['ema_15'].iloc[-2] and
-                5 * (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > 1 / math.sqrt(3)):
+                (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > math.sqrt(3)):
                 self.trend = 100
+            elif (self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['ema_15'].iloc[-2] and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > 1):
+                self.trend = 50
+            elif (self.dfs[symbol]['ema_9'].iloc[-2] > self.dfs[symbol]['ema_15'].iloc[-2] and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) > 1 / math.sqrt(3)):
+                self.trend = 25
             elif (self.dfs[symbol]['ema_15'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
-                  5 * (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-2]) > 1 / math.sqrt(3)):
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) < (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                  (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-2]) > math.sqrt(3)):
                 self.trend = -100
+            elif (self.dfs[symbol]['ema_15'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) < (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                  (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-2]) > 1):
+                self.trend = -50
+            elif (self.dfs[symbol]['ema_15'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
+                  (self.dfs[symbol]['ema_15'].iloc[-2] - self.dfs[symbol]['ema_15'].iloc[-3]) < (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-4]) and
+                  (self.dfs[symbol]['ema_15'].iloc[-3] - self.dfs[symbol]['ema_15'].iloc[-2]) > 1 / math.sqrt(3)):
+                self.trend = -25
             else:
                 self.trend = 0
         
@@ -241,14 +301,16 @@ class LiveOHLC:
         if not self.position:
             option_df = None
             """
-            Attempt to enter CE or PE position based on trend and moving averages.
+            Attempt to enter CE or PE position based on trend, candles and moving averages.
             """
-            candle = (ta.CDLMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
-                      ta.CDLCLOSINGMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
-                      ta.CDLDRAGONFLYDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
-                      ta.CDLGRAVESTONEDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
-                      ta.CDLHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) -
-                      ta.CDLINVERTEDHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']))
+            candle = (
+                ta.CDLMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                ta.CDLCLOSINGMARUBOZU(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                ta.CDLDRAGONFLYDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                ta.CDLGRAVESTONEDOJI(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) +
+                ta.CDLHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close']) -
+                ta.CDLINVERTEDHAMMER(self.dfs[symbol]['open'], self.dfs[symbol]['high'], self.dfs[symbol]['low'], self.dfs[symbol]['close'])
+                )
             
             if (self.trend > 10 and candle.iloc[-2] >= 1 and
                 self.dfs[symbol]['close'].iloc[-2] > self.dfs[symbol]['ema_9'].iloc[-2] and
@@ -256,46 +318,77 @@ class LiveOHLC:
                 """
                 Buy ATM option and subscribe to its live feed.
                 """
-                self.option = get_atm_option(option_type="CE", nifty_price=message.get("ltp"))
+                self.option = get_atm_option(fyers=fyers, nifty_price=message.get("ltp"), option_type="CE", timestamp=get_timestamp(fyers))
+
+                # response = fyers.quotes(data={"symbols":self.option})
+
+                # Initialize option DataFrame with historical + indicators + stop loss + take profit
+                option_df = historical_data(symbol=self.option, today=dt.date.today())
+                self.sl = option_df["low"].iloc[-2]
+                if self.trend == 100:
+                    self.tp = option_df["close"].iloc[-1] + 2 * (option_df["close"].iloc[-1] - self.sl)
+                elif self.trend == 50:
+                    self.tp = option_df["close"].iloc[-1] + 1.5 * (option_df["close"].iloc[-1] - self.sl)
+                else:
+                    self.tp = option_df["close"].iloc[-1] + 1 * (option_df["close"].iloc[-1] - self.sl)
+
+                if option_df["close"].iloc[-1] - self.sl < 1 or self.tp - option_df["close"].iloc[-1] < 1:
+                    print("SL and TP too small, skipping trade")
+                    self.option = None
+                    self.sl = None
+                    self.tp = None
+                    return
+
                 response = fyers.quotes(data={"symbols":self.option})
                 entry = response["d"][0]["v"]["ask"]
 
-                print(entry)
-                log_trade("BUY", self.option, entry)
+                log_trade("BUY", self.option, entry, self.sl, self.tp)
 
-                self.position = True
                 fyers_socket.subscribe(symbols=[self.option], data_type="SymbolUpdate")
 
-                # Initialize option DataFrame with historical + indicators
-                option_df = historical_data(symbol=self.option, today=dt.date.today())
-                self.sl = option_df["low"].iloc[-1]
-                self.tp = entry + 1 * (entry - self.sl)
                 option_df['ema_9'] = ta.EMA(option_df['close'], 9)
                 option_df['ema_15'] = ta.EMA(option_df['close'], 15)
                 self.dfs[self.option] = option_df
+                self.position = True
+                print(entry, self.sl, self.tp)
             elif (self.trend < -10 and candle.iloc[-2] <= -1 and
                   self.dfs[symbol]['close'].iloc[-2] < self.dfs[symbol]['ema_9'].iloc[-2] and
                   self.dfs[symbol]['close'].iloc[-2] < self.dfs[symbol]['ema_15'].iloc[-2]):
                 """
                 Buy ATM option and subscribe to its live feed.
                 """
-                self.option = get_atm_option(option_type="PE", nifty_price=message.get("ltp"))
+                self.option = get_atm_option(fyers=fyers, nifty_price=message.get("ltp"), option_type="PE", timestamp=get_timestamp(fyers))
+                # response = fyers.quotes(data={"symbols":self.option})
+
+                # Initialize option DataFrame with historical + indicators + stop loss + take profit
+                option_df = historical_data(symbol=self.option, today=dt.date.today())
+                self.sl = option_df["low"].iloc[-2]
+                if self.trend == -100:
+                    self.tp = option_df["close"].iloc[-1] + 2 * (option_df["close"].iloc[-1] - self.sl)
+                elif self.trend == -50:
+                    self.tp = option_df["close"].iloc[-1] + 1.5 * (option_df["close"].iloc[-1] - self.sl)
+                else:
+                    self.tp = option_df["close"].iloc[-1] + 1 * (option_df["close"].iloc[-1] - self.sl)
+
+                if option_df["close"].iloc[-1] - self.sl < 1 or self.tp - option_df["close"].iloc[-1] < 1:
+                    print("SL and TP too small, skipping trade")
+                    self.option = None
+                    self.sl = None
+                    self.tp = None
+                    return
+
                 response = fyers.quotes(data={"symbols":self.option})
                 entry = response["d"][0]["v"]["ask"]
 
-                print(entry)
-                log_trade("BUY", self.option, entry)
+                log_trade("BUY", self.option, entry, self.sl, self.tp)
                 
-                self.position = True
                 fyers_socket.subscribe(symbols=[self.option], data_type="SymbolUpdate")
-                
-                # Initialize option DataFrame with historical + indicators
-                option_df = historical_data(symbol=self.option, today=dt.date.today())
-                self.sl = option_df["low"].iloc[-1]
-                self.tp = entry + 2 * (entry - self.sl)
+
                 option_df['ema_9'] = ta.EMA(option_df['close'], 9)
                 option_df['ema_15'] = ta.EMA(option_df['close'], 15)
                 self.dfs[self.option] = option_df
+                self.position = True
+                print(entry, self.sl, self.tp)
         
         # Exit Logic (if in position)
         if self.option and symbol == self.option:
@@ -304,13 +397,17 @@ class LiveOHLC:
             
             print(self.dfs[symbol].tail())
             print(self.trend)
+            second_last_row = self.dfs[symbol].iloc[-2]
             
             if self.option.endswith("CE"):
+                
                 """Exit logic for Call Options."""
                 if self.trend > 10:
                     print("Price Action")
 
-                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
+                    if ((second_last_row['close'] < second_last_row['ema_15'] and
+                         second_last_row['close'] < second_last_row['ema_9']) or
+                         message.get("ltp") <= self.sl or message.get("ltp") >= self.tp):
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -329,7 +426,10 @@ class LiveOHLC:
                 else:
                     print('MA crossover')
 
-                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
+                    if ((second_last_row['close'] < second_last_row['ema_15'] and
+                         second_last_row['close'] < second_last_row['ema_9']) or
+                        second_last_row['ema_9'] < second_last_row['ema_15'] or
+                        message.get("ltp") <= self.sl or message.get("ltp") >= self.tp):
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -348,8 +448,10 @@ class LiveOHLC:
                 """Exit logic for Put Options."""
                 if self.trend < -10:
                     print("Price Action")
-                    
-                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
+
+                    if ((second_last_row['close'] < second_last_row['ema_15'] and
+                         second_last_row['close'] < second_last_row['ema_9']) or
+                         message.get("ltp") <= self.sl or message.get("ltp") >= self.tp):
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
@@ -368,7 +470,10 @@ class LiveOHLC:
                 else:
                     print('MA crossover')
 
-                    if message.get("ltp") <= self.sl or message.get("ltp") >= self.tp:
+                    if ((second_last_row['close'] < second_last_row['ema_15'] and
+                         second_last_row['close'] < second_last_row['ema_9']) or
+                         second_last_row['ema_9'] < second_last_row['ema_15'] or
+                        message.get("ltp") <= self.sl or message.get("ltp") >= self.tp):
                         
                         response = fyers.quotes(data={"symbols":self.option})
                         print(response["d"][0]["v"]["bid"])
